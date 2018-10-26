@@ -19,7 +19,7 @@ const (
 	TargetIP     = "127.0.0.1"
 	TargetPort   = 8080
 	HeaderLength = 18
-	MSS          = 512
+	MSS          = 1024
 )
 
 type Header struct {
@@ -34,6 +34,8 @@ type Header struct {
 var curSeqNum uint32
 var cwndSize uint32
 var cwndBase uint32
+
+var expectedSeqNum uint32
 var rwndSize uint32
 var rwndBase uint32
 
@@ -65,7 +67,7 @@ func packetListener() {
 
 	// Listen loop
 	for {
-		packet := make([]byte, 1024)
+		packet := make([]byte, 1536)
 		n, _, err := pc.ReadFrom(packet)
 		if err != nil {
 			fmt.Println(err.Error())
@@ -91,8 +93,11 @@ func packetHandler(packet []byte) {
 	// SeqNum := header.SeqNum
 	// fmt.Println("Received Packet with ", SrcIP, SrcPort, SeqNum)
 
-
 	if header.Flags&SYN != 0 {
+
+	}
+
+	if header.Flags&FIN != 0 {
 
 	}
 
@@ -102,14 +107,17 @@ func packetHandler(packet []byte) {
 		fmt.Println("Update cwndBase to ", cwndBase)
 	}
 
-	if header.Flags&FIN != 0 {
-
-	}
-
 	// Receive data
 	if len(packet) > HeaderLength {
-		payload := packet[HeaderLength:]
-		sendACK(header, len(payload))
+		// Check whether this packet is expected
+		if header.SeqNum == expectedSeqNum {
+			payload := packet[HeaderLength:]
+			sendACK(header.SeqNum, len(payload))
+		} else if header.SeqNum > expectedSeqNum {
+			fmt.Println("Receive out of order packet with seq: ", header.SeqNum)
+			// Buffer the packet, send duplicate ACK
+			sendACK(expectedSeqNum, 0)
+		}
 	}
 }
 
@@ -156,15 +164,18 @@ func sendData(data []byte) {
 	sendUDP(buf.Bytes())
 	fmt.Println("Send data with SeqNum: ", curSeqNum)
 
+	// Update current sequence number
 	curSeqNum = ((curSeqNum + uint32(len(data))) % (0x01 << 31))
 }
 
-func sendACK(_header Header, payloadLength int) {
+func sendACK(seqNum uint32, payloadLength int) {
+	AckNum := uint32((seqNum + uint32(payloadLength)) % (0x01 << 31))
+
 	header := Header{
 		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
 		SrcPort: SourcePort,
 		SeqNum:  0x00,
-		AckNum:  uint32((_header.SeqNum + uint32(payloadLength)) % (0x01 << 31)),
+		AckNum:  AckNum,
 		Flags:   ACK,
 		WinSize: uint16(4096),
 	}
@@ -174,7 +185,10 @@ func sendACK(_header Header, payloadLength int) {
 	binary.Write(&buf, binary.BigEndian, header)
 
 	sendUDP(buf.Bytes())
-	fmt.Println("Send ACK with AckNum: ", uint32((_header.SeqNum + uint32(payloadLength)) % (0x01 << 31)))
+	fmt.Println("Send ACK with AckNum: ", AckNum)
+
+	// Update next expected sequence number
+	expectedSeqNum = AckNum
 }
 
 func main() {
@@ -184,10 +198,10 @@ func main() {
 	cwndSize = 4 * MSS
 	cwndBase = 0
 
-	data := make([]byte, 32*MSS)
+	data := make([]byte, 1000*MSS)
 
 	for {
-		if curSeqNum-cwndBase <= cwndSize && curSeqNum+MSS <= uint32(len(data)) {
+		if curSeqNum-cwndBase < cwndSize && curSeqNum+MSS <= uint32(len(data)) {
 			sendData(data[curSeqNum : curSeqNum+MSS])
 		}
 	}
