@@ -11,34 +11,39 @@ import (
 )
 
 const (
-	SYN        = 0X01 << 1
-	ACK        = 0X01 << 2
-	FIN        = 0X01 << 3
-	SourceIP   = "127.0.0.1"
-	SourcePort = 20002
-	TargetIP   = "127.0.0.1"
-	TargetPort = 8080
+	SYN          = 0X01 << 1
+	ACK          = 0X01 << 2
+	FIN          = 0X01 << 3
+	SourceIP     = "127.0.0.1"
+	SourcePort   = 20002
+	TargetIP     = "127.0.0.1"
+	TargetPort   = 8080
 	HeaderLength = 18
+	MSS          = 512
 )
 
 type Header struct {
-	srcIP   uint32
-	srcPort uint16
-	seqNum  uint32
-	ackNum  uint32
-	flags   uint16
-	winSize uint16
+	SrcIP   uint32
+	SrcPort uint16
+	SeqNum  uint32
+	AckNum  uint32
+	Flags   uint16
+	WinSize uint16
 }
 
 var curSeqNum uint32
+var cwndSize uint32
+var cwndBase uint32
+var rwndSize uint32
+var rwndBase uint32
 
 func generateSeqNum() uint32 {
 	randSource := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(randSource)
 
-	seqNum := r.Intn(1 << 16)
+	SeqNum := r.Intn(1 << 16)
 
-	return uint32(seqNum)
+	return uint32(SeqNum)
 }
 
 func sendUDP(packet []byte) {
@@ -51,8 +56,8 @@ func sendUDP(packet []byte) {
 	conn.Write(packet)
 }
 
-func recvUDP() {
-	pc, err := net.ListenPacket("udp", TargetIP+":"+strconv.Itoa(TargetPort))
+func packetListener() {
+	pc, err := net.ListenPacket("udp", SourceIP+":"+strconv.Itoa(SourcePort))
 	if err != nil {
 		fmt.Println(err.Error())
 	}
@@ -61,13 +66,12 @@ func recvUDP() {
 	// Listen loop
 	for {
 		packet := make([]byte, 1024)
-		n, addr, err := pc.ReadFrom(packet)
+		n, _, err := pc.ReadFrom(packet)
 		if err != nil {
 			fmt.Println(err.Error())
 		}
 
 		// Handle receving packet
-		fmt.Printf("%s %v", addr.String(), packet[:n])
 		packetHandler(packet[:n])
 	}
 }
@@ -77,41 +81,49 @@ func packetHandler(packet []byte) {
 	var header Header
 	headerBytes := packet[:HeaderLength]
 	headerBuf := bytes.NewReader(headerBytes)
-	err = binary.Read(headerBuf, binary.BigEndian, &header)
+	err := binary.Read(headerBuf, binary.BigEndian, &header)
 	if err != nil {
-			fmt.Println(err.Error())
+		fmt.Println(err.Error())
 	}
 
-	if header.flags & SYN != 0 {
+	// SrcIP := header.SrcIP
+	// SrcPort := header.SrcPort
+	// SeqNum := header.SeqNum
+	// fmt.Println("Received Packet with ", SrcIP, SrcPort, SeqNum)
+
+
+	if header.Flags&SYN != 0 {
 
 	}
 
-	if header.flags & ACK != 0 {
+	// Data is Acknowledged, slide cwnd
+	if header.Flags&ACK != 0 {
+		cwndBase = header.AckNum
+		fmt.Println("Update cwndBase to ", cwndBase)
+	}
+
+	if header.Flags&FIN != 0 {
 
 	}
 
-	if header.flags & FIN != 0 {
-		
-	}
-
-	if (len(packet) > HeaderLength) {
+	// Receive data
+	if len(packet) > HeaderLength {
 		payload := packet[HeaderLength:]
-		fmt.Printf("%v", payload)
+		sendACK(header, len(payload))
 	}
 }
-
 
 // Initiate a connection
 func initConn() {
 	curSeqNum = generateSeqNum()
 
 	header := Header{
-		srcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
-		srcPort: SourcePort,
-		seqNum:  curSeqNum,
-		ackNum:  0x00,
-		flags:   SYN,
-		winSize: uint16(4096),
+		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
+		SrcPort: SourcePort,
+		SeqNum:  curSeqNum,
+		AckNum:  0x00,
+		Flags:   SYN,
+		WinSize: uint16(4096),
 	}
 
 	// Serialize the header
@@ -125,27 +137,58 @@ func closeConn() {
 
 }
 
-func sendData() {
+func sendData(data []byte) {
 	header := Header{
-		srcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
-		srcPort: SourcePort,
-		seqNum:  curSeqNum,
-		ackNum:  0x00,
-		flags:   0x00,
-		winSize: uint16(4096),
+		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
+		SrcPort: SourcePort,
+		SeqNum:  curSeqNum,
+		AckNum:  0x00,
+		Flags:   0x00,
+		WinSize: uint16(4096),
 	}
 
 	// Serialize the header
-	headerBuf := bytes.Buffer{}
-	binary.Write(&headerBuf, binary.BigEndian, header)
+	buf := bytes.Buffer{}
+	binary.Write(&buf, binary.BigEndian, header)
 
-	sendUDP(headerBuf.Bytes())
+	buf.Write(data)
+
+	sendUDP(buf.Bytes())
+	fmt.Println("Send data with SeqNum: ", curSeqNum)
+
+	curSeqNum = ((curSeqNum + uint32(len(data))) % (0x01 << 31))
 }
 
-func sendACK(_header Header) {
+func sendACK(_header Header, payloadLength int) {
+	header := Header{
+		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
+		SrcPort: SourcePort,
+		SeqNum:  0x00,
+		AckNum:  uint32((_header.SeqNum + uint32(payloadLength)) % (0x01 << 31)),
+		Flags:   ACK,
+		WinSize: uint16(4096),
+	}
 
+	// Serialize the header
+	buf := bytes.Buffer{}
+	binary.Write(&buf, binary.BigEndian, header)
+
+	sendUDP(buf.Bytes())
+	fmt.Println("Send ACK with AckNum: ", uint32((_header.SeqNum + uint32(payloadLength)) % (0x01 << 31)))
 }
 
 func main() {
-	initConn()
+	go packetListener()
+
+	curSeqNum = 0
+	cwndSize = 4 * MSS
+	cwndBase = 0
+
+	data := make([]byte, 32*MSS)
+
+	for {
+		if curSeqNum-cwndBase <= cwndSize && curSeqNum+MSS <= uint32(len(data)) {
+			sendData(data[curSeqNum : curSeqNum+MSS])
+		}
+	}
 }
