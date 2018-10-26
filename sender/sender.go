@@ -31,19 +31,22 @@ type Header struct {
 	WinSize uint16
 }
 
+var lastAckSeq uint32
+var syncSeqNum uint32
 var curSeqNum uint32
-var cwndSize uint32
+var cwndSize uint16
 var cwndBase uint32
+var dupAckCount int
 
 var expectedSeqNum uint32
-var rwndSize uint32
+var rwndSize uint16
 var rwndBase uint32
 
 func generateSeqNum() uint32 {
 	randSource := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(randSource)
 
-	SeqNum := r.Intn(1 << 16)
+	SeqNum := r.Intn(1 << 10)
 
 	return uint32(SeqNum)
 }
@@ -101,10 +104,29 @@ func packetHandler(packet []byte) {
 
 	}
 
-	// Data is Acknowledged, slide cwnd
 	if header.Flags&ACK != 0 {
-		cwndBase = header.AckNum
-		fmt.Println("Update cwndBase to ", cwndBase)
+		fmt.Println("Received ACK with AckNum: ", header.AckNum)
+
+		if header.AckNum > lastAckSeq {
+			offset := header.AckNum - lastAckSeq
+			lastAckSeq = header.AckNum
+			// Data is Acknowledged, increase cwnd and slide cwnd
+			if cwndSize < header.WinSize {
+				cwndSize += uint16(offset)
+				if cwndSize > header.WinSize {
+					cwndSize = header.WinSize
+				}
+				fmt.Println("Congestion window size update to ", cwndSize/MSS)
+			}
+			cwndBase += offset
+			fmt.Println("Congestion window base update to ", cwndBase/MSS)
+		} else if header.AckNum == lastAckSeq {
+			// Duplicated ACK
+			dupAckCount += 1
+			if dupAckCount == 3 {
+				fmt.Println("Congestion occurs. Receive 3 DupACKs.")
+			}
+		}
 	}
 
 	// Receive data
@@ -115,7 +137,7 @@ func packetHandler(packet []byte) {
 			sendACK(header.SeqNum, len(payload))
 		} else if header.SeqNum > expectedSeqNum {
 			fmt.Println("Receive out of order packet with seq: ", header.SeqNum)
-			// Buffer the packet, send duplicate ACK
+			// Buffer the packet and send duplicate ACK
 			sendACK(expectedSeqNum, 0)
 		}
 	}
@@ -131,7 +153,7 @@ func initConn() {
 		SeqNum:  curSeqNum,
 		AckNum:  0x00,
 		Flags:   SYN,
-		WinSize: uint16(4096),
+		WinSize: 40960,
 	}
 
 	// Serialize the header
@@ -152,7 +174,7 @@ func sendData(data []byte) {
 		SeqNum:  curSeqNum,
 		AckNum:  0x00,
 		Flags:   0x00,
-		WinSize: uint16(4096),
+		WinSize: 40960,
 	}
 
 	// Serialize the header
@@ -177,7 +199,7 @@ func sendACK(seqNum uint32, payloadLength int) {
 		SeqNum:  0x00,
 		AckNum:  AckNum,
 		Flags:   ACK,
-		WinSize: uint16(4096),
+		WinSize: 40960,
 	}
 
 	// Serialize the header
@@ -194,15 +216,20 @@ func sendACK(seqNum uint32, payloadLength int) {
 func main() {
 	go packetListener()
 
-	curSeqNum = 0
+	syncSeqNum = 32329
+
+	curSeqNum = syncSeqNum
+	lastAckSeq = syncSeqNum
 	cwndSize = 4 * MSS
 	cwndBase = 0
 
-	data := make([]byte, 1000*MSS)
+
+	data := make([]byte, 100*MSS)
 
 	for {
-		if curSeqNum-cwndBase < cwndSize && curSeqNum+MSS <= uint32(len(data)) {
-			sendData(data[curSeqNum : curSeqNum+MSS])
+		offset := curSeqNum - syncSeqNum
+		if offset-cwndBase < uint32(cwndSize) && offset < uint32(len(data)) {
+			sendData(data[offset : offset+MSS])
 		}
 	}
 }
