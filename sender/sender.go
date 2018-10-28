@@ -170,9 +170,11 @@ func packetHandler(packet []byte) {
 
 			AckNum := header.SeqNum + MSS
 			_, ok := bufSeqNumSet[expectedSeqNum+MSS]
+			delete(bufSeqNumSet, expectedSeqNum+MSS)
 			for i := 2; ok; i++ {
 				AckNum = expectedSeqNum + uint32(i)*MSS
 				_, ok = bufSeqNumSet[expectedSeqNum+uint32(i)*MSS]
+				delete(bufSeqNumSet, expectedSeqNum+uint32(i)*MSS)
 			}
 			sendACK(AckNum)
 			expectedSeqNum = AckNum
@@ -264,7 +266,7 @@ func sendFile() {
 	ssthresh = 32 * MSS
 	dupAckCount = 0
 
-	file := make([]byte, 5000*MSS)
+	file := make([]byte, 100*MSS)
 
 	for {
 		select {
