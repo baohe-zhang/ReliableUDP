@@ -61,14 +61,13 @@ func generateSeqNum() uint32 {
 	return uint32(SeqNum)
 }
 
-func sendUDP(packet []byte) {
+func setupConn() net.Conn {
 	conn, err := net.Dial("udp", TargetIP+":"+strconv.Itoa(TargetPort))
 	if err != nil {
 		fmt.Println(err.Error())
 	}
-	defer conn.Close()
 
-	conn.Write(packet)
+	return conn
 }
 
 func packetListener() {
@@ -77,7 +76,6 @@ func packetListener() {
 		fmt.Println(err.Error())
 	}
 	defer pc.Close()
-	ch <- 0 // Block sender until listener. Used in sender only.
 
 	// Listen loop
 	packet := make([]byte, 1536)
@@ -163,6 +161,7 @@ func packetHandler(packet []byte) {
 				// Enter Fast Recovery state
 				fmt.Println("[Congestion] receive 3 DupACKs.")
 				ssthresh = cwndSize / 2
+				fmt.Println("[Congestion] ssthresh set to ", ssthresh/MSS)
 				cwndSize = ssthresh + 3*MSS
 				fmt.Println("[Congestion] cw size decrease to ", cwndSize/MSS)
 				// Notify sender goroutine to resend data through channel
@@ -203,7 +202,7 @@ func packetHandler(packet []byte) {
 			}
 
 			// Send ACK and update expectedSeqNum
-			sendACK(AckNum)
+			ch <- AckNum
 			expectedSeqNum = AckNum
 
 		} else if header.SeqNum > expectedSeqNum {
@@ -216,7 +215,7 @@ func packetHandler(packet []byte) {
 			bufSeqNumSet[header.SeqNum] = true
 
 			// Send duplicate ACK
-			sendACK(expectedSeqNum)
+			ch <- expectedSeqNum
 
 		} else {
 			fmt.Println("[Already Acknowledged] Receive Acked packet with SeqNum: ", header.SeqNum/MSS)
@@ -248,7 +247,7 @@ func packetHandler(packet []byte) {
 
 // }
 
-func sendData(seqNum uint32, data []byte) {
+func sendData(conn net.Conn, seqNum uint32, data []byte) {
 	header := Header{
 		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
 		SrcPort: SourcePort,
@@ -264,11 +263,11 @@ func sendData(seqNum uint32, data []byte) {
 
 	buf.Write(data)
 
-	sendUDP(buf.Bytes())
+	conn.Write(buf.Bytes())
 	fmt.Println("Send data with SeqNum: ", seqNum/MSS)
 }
 
-func sendACK(AckNum uint32) {
+func sendACK(conn net.Conn, AckNum uint32) {
 	header := Header{
 		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
 		SrcPort: SourcePort,
@@ -282,7 +281,7 @@ func sendACK(AckNum uint32) {
 	buf := bytes.Buffer{}
 	binary.Write(&buf, binary.BigEndian, header)
 
-	sendUDP(buf.Bytes())
+	conn.Write(buf.Bytes())
 	fmt.Println("Send ACK with AckNum: ", AckNum/MSS)
 }
 
@@ -304,6 +303,8 @@ func startTimer() {
 }
 
 func sendFile() {
+	file := make([]byte, 100000*MSS)
+
 	// Init sender's global variables
 	syncSeqNum = 0
 	curSeqNum = syncSeqNum
@@ -312,11 +313,16 @@ func sendFile() {
 	cwndBase = 0
 	ssthresh = 32 * MSS
 	dupAckCount = 0
+	ch = make(chan uint32)
 
-	file := make([]byte, 10000*MSS)
+	go packetListener()
 
 	// Init RTO timer
 	startTimer()
+
+	// setup conn
+	conn := setupConn()
+	defer conn.Close()
 
 	for {
 		select {
@@ -324,15 +330,15 @@ func sendFile() {
 		case seqNum := <-ch:
 			// Retransmit seqNum
 			offset := seqNum - syncSeqNum
-			sendData(seqNum, file[offset:offset+MSS])
+			sendData(conn, seqNum, file[offset:offset+MSS])
 
 		default:
 			offset := curSeqNum - syncSeqNum
 			if offset-cwndBase < uint32(cwndSize) && offset < uint32(len(file)) {
-				// if generateSeqNum() < 1000 {
-				// 	sendData(curSeqNum, file[offset:offset+MSS])
-				// }
-				sendData(curSeqNum, file[offset:offset+MSS])
+				if generateSeqNum() < 990 {
+					sendData(conn, curSeqNum, file[offset:offset+MSS])
+				}
+				// sendData(conn, curSeqNum, file[offset:offset+MSS])
 				curSeqNum = syncSeqNum + offset + MSS
 			}
 		}
@@ -349,22 +355,30 @@ func recvFile() {
 	expectedSeqNum = syncSeqNum
 	bufSeqNumSet = map[uint32]bool{}    // Mark out of order packet
 	bufPayloadMap = map[uint32][]byte{} // Buffer out of order packet's payload
-
-	packetListener()
-}
-
-func main() {
 	ch = make(chan uint32)
 
 	go packetListener()
 
-	<-ch
-	sendFile()
+	conn := setupConn()
+	defer conn.Close()
 
-	// start := time.Now()
-	// for i := 0; i < 100000; i++ {
-	// 	sendData(data[i : i+MSS])
-	// }
-	// end := time.Now()
-	// fmt.Println(end.Sub(start))
+	for {
+		select {
+		case AckNum := <-ch:
+			sendACK(conn, AckNum)
+
+		default:
+		}
+	}
 }
+
+func main() {
+	sendFile()
+}
+
+// start := time.Now()
+// for i := 0; i < 100000; i++ {
+// 	sendData(data[i : i+MSS])
+// }
+// end := time.Now()
+// fmt.Println(end.Sub(start))
