@@ -1,2 +1,2 @@
 # ReliableUDP
-Add TCP-like header to UDP to achieve reliable data transfer
+Add TCP's reliable and congestion control feature to UDP to achieve reliable data transfer
