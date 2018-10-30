@@ -20,6 +20,7 @@ const (
 	TargetPort   = 8080
 	HeaderLength = 18
 	MSS          = 1024
+	RTO          = 30 * time.Millisecond
 )
 
 type Header struct {
@@ -31,6 +32,7 @@ type Header struct {
 	WinSize uint16
 }
 
+// Sender's variables
 var syncSeqNum uint32
 var lastAckNum uint32
 var curSeqNum uint32
@@ -40,19 +42,21 @@ var ssthresh uint16
 var dupAckCount uint8
 var isCongestion bool
 var culmulativeOffset uint16
+var timer *time.Timer
+var ch chan uint32
 
+// Receiver's variables
 var expectedSeqNum uint32
 var rwndSize uint16
 var rwndBase uint32
 var bufSeqNumSet map[uint32]bool
-
-var ch chan uint32
+var bufPayloadMap map[uint32][]byte
 
 func generateSeqNum() uint32 {
 	randSource := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(randSource)
 
-	SeqNum := r.Intn(1 << 10)
+	SeqNum := r.Intn(1000)
 
 	return uint32(SeqNum)
 }
@@ -73,7 +77,7 @@ func packetListener() {
 		fmt.Println(err.Error())
 	}
 	defer pc.Close()
-	ch <- 0 // Block sender until listener
+	ch <- 0 // Block sender until listener. Used in sender only.
 
 	// Listen loop
 	packet := make([]byte, 1536)
@@ -112,23 +116,26 @@ func packetHandler(packet []byte) {
 	}
 
 	if header.Flags&ACK != 0 {
-		fmt.Println("Received ACK with AckNum: ", header.AckNum)
+		fmt.Println("Received ACK with AckNum: ", header.AckNum/MSS)
 
 		if header.AckNum > lastAckNum {
 			// New ACK
 			dupAckCount = 0 // Reset duplicate ACK count
 			offset := header.AckNum - lastAckNum
 			lastAckNum = header.AckNum
+
 			// Change congestion window size
 			if isCongestion {
 				// State transtion from Fast Recovery to Congestion Avodiance
 				isCongestion = false
 				cwndSize = ssthresh
 				fmt.Println("[Slow Start] cw size set to ssthresh", ssthresh/MSS)
+
 			} else if cwndSize <= ssthresh-uint16(offset) && cwndSize <= header.WinSize-uint16(offset) {
 				// Slow Start
 				cwndSize += uint16(offset)
 				fmt.Println("[Slow Start] cw size increase to ", cwndSize/MSS)
+
 			} else if cwndSize > ssthresh-uint16(offset) && cwndSize <= header.WinSize-uint16(offset) {
 				// Congestion Avoidance
 				culmulativeOffset += uint16(offset)
@@ -140,7 +147,14 @@ func packetHandler(packet []byte) {
 			}
 			// Slide window
 			cwndBase += offset
-			fmt.Println("cw base increase to ", cwndBase/MSS)
+			fmt.Println("[Slide Window] cw base increase to ", cwndBase/MSS)
+
+			// Restart RTO timer
+			stop := timer.Stop()
+			if stop {
+				startTimer()
+			}
+
 		} else if header.AckNum == lastAckNum {
 			// Duplicate ACK
 			dupAckCount += 1
@@ -153,6 +167,7 @@ func packetHandler(packet []byte) {
 				fmt.Println("[Congestion] cw size decrease to ", cwndSize/MSS)
 				// Notify sender goroutine to resend data through channel
 				ch <- lastAckNum
+
 			} else if dupAckCount > 3 {
 				if cwndSize <= header.WinSize-MSS {
 					cwndSize += MSS
@@ -164,59 +179,74 @@ func packetHandler(packet []byte) {
 
 	// Receive data
 	if len(packet) > HeaderLength {
-		if header.SeqNum == expectedSeqNum {
-			fmt.Println("[In Order] receive packet with SeqNum: ", header.SeqNum)
-			// payload := packet[HeaderLength:]
 
-			AckNum := header.SeqNum + MSS
+		if header.SeqNum == expectedSeqNum {
+			fmt.Println("[In Order] receive packet with SeqNum: ", expectedSeqNum/MSS)
+			// Deliver payload
+			payload := packet[HeaderLength:]
+			fmt.Printf("deliver %d bytes of seqNum %d\n", len(payload), expectedSeqNum/MSS)
+
+			AckNum := expectedSeqNum + MSS
+
+			// Check if there are consecutive buffered ACK
 			_, ok := bufSeqNumSet[expectedSeqNum+MSS]
 			delete(bufSeqNumSet, expectedSeqNum+MSS)
 			for i := 2; ok; i++ {
+				// Deliver payload with seqNum expectedSeqNum + uint32(i-1)*MSS
+				buf_payload := bufPayloadMap[expectedSeqNum+uint32(i-1)*MSS]
+				fmt.Printf("deliver %d bytes of seqNum %d\n", len(buf_payload), (expectedSeqNum+uint32(i-1)*MSS)/MSS)
+				delete(bufPayloadMap, expectedSeqNum+uint32(i-1)*MSS)
+
 				AckNum = expectedSeqNum + uint32(i)*MSS
 				_, ok = bufSeqNumSet[expectedSeqNum+uint32(i)*MSS]
 				delete(bufSeqNumSet, expectedSeqNum+uint32(i)*MSS)
 			}
+
+			// Send ACK and update expectedSeqNum
 			sendACK(AckNum)
 			expectedSeqNum = AckNum
-			// if bufferedAckNum > AckNum {
-			// 	expectedSeqNum = bufferedAckNum
-			// } else {
-			// 	expectedSeqNum = AckNum
-			// }
+
 		} else if header.SeqNum > expectedSeqNum {
-			fmt.Println("[Out of Order] receive packet with SeqNum: ", header.SeqNum)
-			sendACK(expectedSeqNum)
+			fmt.Println("[Out of Order] receive packet with SeqNum: ", header.SeqNum/MSS)
+			// Buffer payload
+			payload := packet[HeaderLength:]
+			bufPayloadMap[header.SeqNum] = payload
+
+			// Mark the out of order packet
 			bufSeqNumSet[header.SeqNum] = true
-			// Buffer the packet and send duplicate ACK
-			// payload := packet[HeaderLength:]
-			// bufferedAckNum := uint32((header.SeqNum + uint32(len(payload))) % (0x01 << 31))
+
+			// Send duplicate ACK
+			sendACK(expectedSeqNum)
+
+		} else {
+			fmt.Println("[Already Acknowledged] Receive Acked packet with SeqNum: ", header.SeqNum/MSS)
 		}
 	}
 }
 
 // Initiate a connection
-func initConn() {
-	curSeqNum = generateSeqNum()
+// func initConn() {
+// 	curSeqNum = generateSeqNum()
 
-	header := Header{
-		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
-		SrcPort: SourcePort,
-		SeqNum:  curSeqNum,
-		AckNum:  0x00,
-		Flags:   SYN,
-		WinSize: 32 * MSS,
-	}
+// 	header := Header{
+// 		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
+// 		SrcPort: SourcePort,
+// 		SeqNum:  curSeqNum,
+// 		AckNum:  0x00,
+// 		Flags:   SYN,
+// 		WinSize: 32 * MSS,
+// 	}
 
-	// Serialize the header
-	headerBuf := bytes.Buffer{}
-	binary.Write(&headerBuf, binary.BigEndian, header)
+// 	// Serialize the header
+// 	headerBuf := bytes.Buffer{}
+// 	binary.Write(&headerBuf, binary.BigEndian, header)
 
-	sendUDP(headerBuf.Bytes())
-}
+// 	sendUDP(headerBuf.Bytes())
+// }
 
-func closeConn() {
+// func closeConn() {
 
-}
+// }
 
 func sendData(seqNum uint32, data []byte) {
 	header := Header{
@@ -235,7 +265,7 @@ func sendData(seqNum uint32, data []byte) {
 	buf.Write(data)
 
 	sendUDP(buf.Bytes())
-	fmt.Println("Send data with SeqNum: ", seqNum)
+	fmt.Println("Send data with SeqNum: ", seqNum/MSS)
 }
 
 func sendACK(AckNum uint32) {
@@ -253,7 +283,24 @@ func sendACK(AckNum uint32) {
 	binary.Write(&buf, binary.BigEndian, header)
 
 	sendUDP(buf.Bytes())
-	fmt.Println("Send ACK with AckNum: ", AckNum)
+	fmt.Println("Send ACK with AckNum: ", AckNum/MSS)
+}
+
+func startTimer() {
+	timer = time.NewTimer(RTO)
+	go func() {
+		<-timer.C
+		fmt.Println("[RTO timeout]")
+		// Notify sender to retransmit
+		ch <- (cwndBase - syncSeqNum)
+		// Update variables
+		ssthresh = cwndSize / 2
+		cwndSize = 1 * MSS
+		fmt.Println("[RTO timeout] cw size decrease to ", cwndSize/MSS)
+		dupAckCount = 0
+		// Start a new timer
+		startTimer()
+	}()
 }
 
 func sendFile() {
@@ -266,25 +313,44 @@ func sendFile() {
 	ssthresh = 32 * MSS
 	dupAckCount = 0
 
-	file := make([]byte, 100*MSS)
+	file := make([]byte, 10000*MSS)
+
+	// Init RTO timer
+	startTimer()
 
 	for {
 		select {
+
 		case seqNum := <-ch:
+			// Retransmit seqNum
 			offset := seqNum - syncSeqNum
 			sendData(seqNum, file[offset:offset+MSS])
+
 		default:
 			offset := curSeqNum - syncSeqNum
 			if offset-cwndBase < uint32(cwndSize) && offset < uint32(len(file)) {
+				// if generateSeqNum() < 1000 {
+				// 	sendData(curSeqNum, file[offset:offset+MSS])
+				// }
 				sendData(curSeqNum, file[offset:offset+MSS])
 				curSeqNum = syncSeqNum + offset + MSS
 			}
 		}
+
 		if cwndBase == uint32(len(file)) {
 			fmt.Println("finish")
 			break
 		}
 	}
+}
+
+func recvFile() {
+	syncSeqNum = 0
+	expectedSeqNum = syncSeqNum
+	bufSeqNumSet = map[uint32]bool{}    // Mark out of order packet
+	bufPayloadMap = map[uint32][]byte{} // Buffer out of order packet's payload
+
+	packetListener()
 }
 
 func main() {
