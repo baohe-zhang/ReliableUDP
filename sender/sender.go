@@ -8,6 +8,8 @@ import (
 	"net"
 	"strconv"
 	"time"
+	"os"
+	"io"
 )
 
 const (
@@ -312,8 +314,53 @@ func startTimer() {
 	}()
 }
 
-func sendFile() {
-	file := make([]byte, 10*MSS)
+func recvFile() {
+	bufSeqNumSet = map[uint32]bool{}    // Mark out of order packet
+	bufPayloadMap = map[uint32][]byte{} // Buffer out of order packet's payload
+	ch = make(chan uint32)
+
+	// Setup listening conn
+	go packetListener(SrcAddr)
+
+	// Receive SYN
+	destIP := <-ch
+	destPort := <-ch
+	syncSeqNum = <-ch
+	expectedSeqNum = syncSeqNum
+
+	// Parse DestAddr
+	destAddr := StringIP(destIP) + ":" + strconv.Itoa(int(destPort))
+
+	conn := setupConn(destAddr)
+	defer conn.Close()
+
+	// Send ACK to accept connection
+	sendACK(conn, syncSeqNum)
+
+	for {
+		select {
+		case AckNum := <-ch:
+			sendACK(conn, AckNum)
+
+		default:
+		}
+	}
+}
+
+func sendFile(filename string) {
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+	defer file.Close()
+
+	var fileBuf bytes.Buffer
+	io.Copy(&fileBuf, file)
+
+	fileBytes := fileBuf.Bytes()
+	filesize := uint32(len(fileBytes))
+
+	fmt.Printf("%s's size: %d\n", filename, filesize)
 
 	// Init sender's global variables
 	syncSeqNum = 0
@@ -347,60 +394,34 @@ func sendFile() {
 		case seqNum := <-ch:
 			// Retransmit seqNum
 			offset := seqNum - syncSeqNum
-			sendDATA(conn, seqNum, file[offset:offset+MSS])
+			if offset+MSS < filesize {
+				sendDATA(conn, seqNum, fileBytes[offset:offset+MSS])
+			} else {
+
+			}
 
 		default:
 			offset := curSeqNum - syncSeqNum
-			if offset-cwndBase < uint32(cwndSize) && offset < uint32(len(file)) {
-				if generateSeqNum() < 1000 {
-					sendDATA(conn, curSeqNum, file[offset:offset+MSS])
+			if offset-cwndBase < uint32(cwndSize) {
+				if offset+MSS < filesize {
+					sendDATA(conn, curSeqNum, fileBytes[offset:offset+MSS])
+					curSeqNum = syncSeqNum + offset + MSS
+				} else {
+					sendDATA(conn, curSeqNum, fileBytes[offset:filesize])
+					curSeqNum = syncSeqNum + offset + (filesize - offset)
 				}
-				// sendDATA(conn, curSeqNum, file[offset:offset+MSS])
-				curSeqNum = syncSeqNum + offset + MSS
 			}
 		}
 
-		if cwndBase == uint32(len(file)) {
+		if cwndBase == filesize {
 			fmt.Println("finish")
 			break
 		}
 	}
 }
 
-func recvFile() {
-	bufSeqNumSet = map[uint32]bool{}    // Mark out of order packet
-	bufPayloadMap = map[uint32][]byte{} // Buffer out of order packet's payload
-	ch = make(chan uint32)
-
-	go packetListener(SrcAddr)
-
-	// Receive SYN
-	destIP := <-ch
-	destPort := <-ch
-	syncSeqNum = <-ch
-	expectedSeqNum = syncSeqNum
-
-	// Parse DestAddr
-	destAddr := StringIP(destIP) + ":" + strconv.Itoa(int(destPort))
-
-	conn := setupConn(destAddr)
-	defer conn.Close()
-
-	// Send ACK to accept connection
-	sendACK(conn, syncSeqNum)
-
-	for {
-		select {
-		case AckNum := <-ch:
-			sendACK(conn, AckNum)
-
-		default:
-		}
-	}
-}
-
 func main() {
-	sendFile()
+	sendFile("file")
 }
 
 // start := time.Now()
