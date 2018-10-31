@@ -199,24 +199,36 @@ func packetHandler(packet []byte) {
 
 		if header.SeqNum == expectedSeqNum {
 			fmt.Println("[In Order] receive packet with SeqNum: ", expectedSeqNum/MSS)
+
 			// Deliver payload
 			payload := packet[HeaderLength:]
-			fmt.Printf("deliver %d bytes of seqNum %d\n", len(payload), expectedSeqNum/MSS)
+			payloadSize := uint32(len(payload))
+			fmt.Printf("deliver %d bytes of seqNum %d\n", payloadSize, expectedSeqNum/MSS)
 
-			AckNum := expectedSeqNum + MSS
+			culmulativePayloadSize := payloadSize
+			AckNum := expectedSeqNum + culmulativePayloadSize
 
 			// Check if there are consecutive buffered ACK
-			_, ok := bufSeqNumSet[expectedSeqNum+MSS]
-			delete(bufSeqNumSet, expectedSeqNum+MSS)
-			for i := 2; ok; i++ {
-				// Deliver payload with seqNum expectedSeqNum + uint32(i-1)*MSS
-				buf_payload := bufPayloadMap[expectedSeqNum+uint32(i-1)*MSS]
-				fmt.Printf("deliver %d bytes of seqNum %d\n", len(buf_payload), (expectedSeqNum+uint32(i-1)*MSS)/MSS)
-				delete(bufPayloadMap, expectedSeqNum+uint32(i-1)*MSS)
+			_, ok := bufSeqNumSet[AckNum]
+			if ok {
+				delete(bufSeqNumSet, AckNum)
+			}
 
-				AckNum = expectedSeqNum + uint32(i)*MSS
-				_, ok = bufSeqNumSet[expectedSeqNum+uint32(i)*MSS]
-				delete(bufSeqNumSet, expectedSeqNum+uint32(i)*MSS)
+			for ok {
+				// Deliver buffered payload
+				bufPayload := bufPayloadMap[AckNum]
+				bufPayloadSize := uint32(len(bufPayload))
+				fmt.Printf("deliver %d bytes of seqNum %d\n", bufPayloadSize, AckNum/MSS)
+				delete(bufPayloadMap, AckNum)
+
+				culmulativePayloadSize += bufPayloadSize
+				AckNum = expectedSeqNum + culmulativePayloadSize
+
+				// Check if there are consecutive buffered ACK
+				_, ok = bufSeqNumSet[AckNum]
+				if ok {
+					delete(bufSeqNumSet, AckNum)
+				}
 			}
 
 			// Send ACK and update expectedSeqNum
@@ -397,7 +409,7 @@ func sendFile(filename string) {
 			if offset+MSS < filesize {
 				sendDATA(conn, seqNum, fileBytes[offset:offset+MSS])
 			} else {
-
+				sendDATA(conn, curSeqNum, fileBytes[offset:filesize])
 			}
 
 		default:
