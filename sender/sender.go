@@ -14,13 +14,14 @@ const (
 	SYN          = 0X01 << 1
 	ACK          = 0X01 << 2
 	FIN          = 0X01 << 3
-	SourceIP     = "127.0.0.1"
-	SourcePort   = 20002
-	TargetIP     = "127.0.0.1"
-	TargetPort   = 8080
+	DATA         = 0X01 << 4
+	SrcIP        = "127.0.0.1"
+	SrcPort      = 20002
 	HeaderLength = 18
 	MSS          = 1024
 	RTO          = 30 * time.Millisecond
+	DestAddr     = "127.0.0.1:8080"
+	SrcAddr      = "127.0.0.1:20002"
 )
 
 type Header struct {
@@ -43,7 +44,6 @@ var dupAckCount uint8
 var isCongestion bool
 var culmulativeOffset uint16
 var timer *time.Timer
-var ch chan uint32
 
 // Receiver's variables
 var expectedSeqNum uint32
@@ -51,6 +51,19 @@ var rwndSize uint16
 var rwndBase uint32
 var bufSeqNumSet map[uint32]bool
 var bufPayloadMap map[uint32][]byte
+
+// Common variables
+var ch chan uint32
+
+func BinaryIP(stringIP string) uint32 {
+	return binary.BigEndian.Uint32(net.ParseIP(stringIP).To4())
+}
+
+func StringIP(binaryIP uint32) string {
+	IP := make(net.IP, 4)
+	binary.BigEndian.PutUint32(IP, binaryIP)
+	return IP.String()
+}
 
 func generateSeqNum() uint32 {
 	randSource := rand.NewSource(time.Now().UnixNano())
@@ -61,8 +74,8 @@ func generateSeqNum() uint32 {
 	return uint32(SeqNum)
 }
 
-func setupConn() net.Conn {
-	conn, err := net.Dial("udp", TargetIP+":"+strconv.Itoa(TargetPort))
+func setupConn(addr string) net.Conn {
+	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		fmt.Println(err.Error())
 	}
@@ -70,8 +83,8 @@ func setupConn() net.Conn {
 	return conn
 }
 
-func packetListener() {
-	pc, err := net.ListenPacket("udp", SourceIP+":"+strconv.Itoa(SourcePort))
+func packetListener(addr string) {
+	pc, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		fmt.Println(err.Error())
 	}
@@ -100,13 +113,12 @@ func packetHandler(packet []byte) {
 		fmt.Println(err.Error())
 	}
 
-	// SrcIP := header.SrcIP
-	// SrcPort := header.SrcPort
-	// SeqNum := header.SeqNum
-	// fmt.Println("Received Packet with IP: ", SrcIP)
-
 	if header.Flags&SYN != 0 {
+		fmt.Printf("Receive SYN from (%s:%d) with SeqNum: %d\n", StringIP(header.SrcIP), header.SrcPort, header.SeqNum)
 
+		ch <- header.SrcIP
+		ch <- uint32(header.SrcPort)
+		ch <- header.SeqNum
 	}
 
 	if header.Flags&FIN != 0 {
@@ -115,6 +127,11 @@ func packetHandler(packet []byte) {
 
 	if header.Flags&ACK != 0 {
 		fmt.Println("Received ACK with AckNum: ", header.AckNum/MSS)
+
+		if header.AckNum == syncSeqNum {
+			// Connection request accepted, notify sending goroutine
+			ch <- syncSeqNum
+		}
 
 		if header.AckNum > lastAckNum {
 			// New ACK
@@ -176,8 +193,7 @@ func packetHandler(packet []byte) {
 		}
 	}
 
-	// Receive data
-	if len(packet) > HeaderLength {
+	if header.Flags&DATA != 0 {
 
 		if header.SeqNum == expectedSeqNum {
 			fmt.Println("[In Order] receive packet with SeqNum: ", expectedSeqNum/MSS)
@@ -223,37 +239,31 @@ func packetHandler(packet []byte) {
 	}
 }
 
-// Initiate a connection
-// func initConn() {
-// 	curSeqNum = generateSeqNum()
-
-// 	header := Header{
-// 		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
-// 		SrcPort: SourcePort,
-// 		SeqNum:  curSeqNum,
-// 		AckNum:  0x00,
-// 		Flags:   SYN,
-// 		WinSize: 32 * MSS,
-// 	}
-
-// 	// Serialize the header
-// 	headerBuf := bytes.Buffer{}
-// 	binary.Write(&headerBuf, binary.BigEndian, header)
-
-// 	sendUDP(headerBuf.Bytes())
-// }
-
-// func closeConn() {
-
-// }
-
-func sendData(conn net.Conn, seqNum uint32, data []byte) {
+func sendSYN(conn net.Conn, seqNum uint32) {
 	header := Header{
-		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
-		SrcPort: SourcePort,
+		SrcIP:   BinaryIP(SrcIP),
+		SrcPort: SrcPort,
 		SeqNum:  seqNum,
 		AckNum:  0x00,
-		Flags:   0x00,
+		Flags:   SYN,
+		WinSize: 32 * MSS,
+	}
+
+	// Serialize the header
+	buf := bytes.Buffer{}
+	binary.Write(&buf, binary.BigEndian, header)
+
+	conn.Write(buf.Bytes())
+	fmt.Println("Send SYN with SeqNum: ", seqNum/MSS)
+}
+
+func sendDATA(conn net.Conn, seqNum uint32, data []byte) {
+	header := Header{
+		SrcIP:   BinaryIP(SrcIP),
+		SrcPort: SrcPort,
+		SeqNum:  seqNum,
+		AckNum:  0x00,
+		Flags:   DATA,
 		WinSize: 32 * MSS,
 	}
 
@@ -264,13 +274,13 @@ func sendData(conn net.Conn, seqNum uint32, data []byte) {
 	buf.Write(data)
 
 	conn.Write(buf.Bytes())
-	fmt.Println("Send data with SeqNum: ", seqNum/MSS)
+	fmt.Println("Send DATA with SeqNum: ", seqNum/MSS)
 }
 
 func sendACK(conn net.Conn, AckNum uint32) {
 	header := Header{
-		SrcIP:   binary.BigEndian.Uint32(net.ParseIP(SourceIP).To4()),
-		SrcPort: SourcePort,
+		SrcIP:   BinaryIP(SrcIP),
+		SrcPort: SrcPort,
 		SeqNum:  0x00,
 		AckNum:  AckNum,
 		Flags:   ACK,
@@ -303,7 +313,7 @@ func startTimer() {
 }
 
 func sendFile() {
-	file := make([]byte, 100000*MSS)
+	file := make([]byte, 10*MSS)
 
 	// Init sender's global variables
 	syncSeqNum = 0
@@ -315,14 +325,21 @@ func sendFile() {
 	dupAckCount = 0
 	ch = make(chan uint32)
 
-	go packetListener()
+	// Setup listening conn
+	go packetListener(SrcAddr)
+
+	// Setup sending conn
+	conn := setupConn(DestAddr)
+	defer conn.Close()
+
+	// Initiates a connection and block until receives the other side's ACK
+	sendSYN(conn, syncSeqNum)
+	code := <-ch
+	for code != syncSeqNum {
+	}
 
 	// Init RTO timer
 	startTimer()
-
-	// setup conn
-	conn := setupConn()
-	defer conn.Close()
 
 	for {
 		select {
@@ -330,15 +347,15 @@ func sendFile() {
 		case seqNum := <-ch:
 			// Retransmit seqNum
 			offset := seqNum - syncSeqNum
-			sendData(conn, seqNum, file[offset:offset+MSS])
+			sendDATA(conn, seqNum, file[offset:offset+MSS])
 
 		default:
 			offset := curSeqNum - syncSeqNum
 			if offset-cwndBase < uint32(cwndSize) && offset < uint32(len(file)) {
-				if generateSeqNum() < 990 {
-					sendData(conn, curSeqNum, file[offset:offset+MSS])
+				if generateSeqNum() < 1000 {
+					sendDATA(conn, curSeqNum, file[offset:offset+MSS])
 				}
-				// sendData(conn, curSeqNum, file[offset:offset+MSS])
+				// sendDATA(conn, curSeqNum, file[offset:offset+MSS])
 				curSeqNum = syncSeqNum + offset + MSS
 			}
 		}
@@ -351,16 +368,26 @@ func sendFile() {
 }
 
 func recvFile() {
-	syncSeqNum = 0
-	expectedSeqNum = syncSeqNum
 	bufSeqNumSet = map[uint32]bool{}    // Mark out of order packet
 	bufPayloadMap = map[uint32][]byte{} // Buffer out of order packet's payload
 	ch = make(chan uint32)
 
-	go packetListener()
+	go packetListener(SrcAddr)
 
-	conn := setupConn()
+	// Receive SYN
+	destIP := <-ch
+	destPort := <-ch
+	syncSeqNum = <-ch
+	expectedSeqNum = syncSeqNum
+
+	// Parse DestAddr
+	destAddr := StringIP(destIP) + ":" + strconv.Itoa(int(destPort))
+
+	conn := setupConn(destAddr)
 	defer conn.Close()
+
+	// Send ACK to accept connection
+	sendACK(conn, syncSeqNum)
 
 	for {
 		select {
