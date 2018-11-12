@@ -13,13 +13,16 @@ import (
 )
 
 const (
+	SlowStart = 0
+	CongestionAvoidance = 1
+	FastRecovery = 2
 	SYN          = 0X01 << 1
 	ACK          = 0X01 << 2
 	FIN          = 0X01 << 3
 	DATA         = 0X01 << 4
 	HeaderLength = 12
 	MSS          = 1024
-	RTO          = 30 * time.Millisecond
+	RTO          = 100 * time.Millisecond
 	DestAddr     = "127.0.0.1:8080"
 )
 
@@ -31,17 +34,19 @@ type Header struct {
 }
 
 // Sender's variables
+var state uint8
 var syncSeqNum uint32
-var lastAckNum uint32
+var curAckNum uint32
 var nextSeqNum uint32
 var cwndSize uint16
 var cwndBase uint32
 var ssthresh uint16
 var dupAckCount uint8
 var isCongestion bool
-var culmulativeOffset uint16
+var culmulativeAckBytes uint16
 var timer *time.Timer
 var ch chan uint32
+var winUpdate chan bool
 // var mutex sync.Mutex
 
 
@@ -58,7 +63,6 @@ func StringIP(binaryIP uint32) string {
 func generateSeqNum() uint32 {
 	randSource := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(randSource)
-
 	SeqNum := r.Intn(1000)
 
 	return uint32(SeqNum)
@@ -105,70 +109,90 @@ func packetHandler(packet []byte) {
 	}
 
 	if header.Flags&ACK != 0 {
-		fmt.Println("received ACK: ", header.AckNum/MSS)
 
 		if header.AckNum == syncSeqNum {
 			// Connection request accepted, notify sending goroutine
 			ch <- syncSeqNum
 		}
 
-		if header.AckNum > lastAckNum {
+		if header.AckNum > curAckNum {
 			// New ACK
-			dupAckCount = 0 // Reset duplicate ACK count
-			offset := header.AckNum - lastAckNum
-			lastAckNum = header.AckNum
-
-			// Change congestion window size
-			if isCongestion {
-				// State transtion from Fast Recovery to Congestion Avodiance
-				isCongestion = false
+			fmt.Println("receive new ACK: ", header.AckNum/MSS)
+			AckBytes := header.AckNum - curAckNum
+			if state == FastRecovery {
+				dupAckCount = 0
+				state = CongestionAvoidance
 				cwndSize = ssthresh
-				fmt.Println("[slow start] cw size set to ssthresh", ssthresh/MSS)
+				fmt.Printf("[fast reocovery] cw set to %d\n", cwndSize/MSS)
 
-			} else if cwndSize <= ssthresh-uint16(offset) && cwndSize <= header.WinSize-uint16(offset) {
-				// Slow Start
-				cwndSize += uint16(offset)
-				fmt.Println("[slow start] cw size increase to ", cwndSize/MSS)
-
-			} else if cwndSize > ssthresh-uint16(offset) && cwndSize <= header.WinSize-uint16(offset) {
-				// Congestion Avoidance
-				culmulativeOffset += uint16(offset)
-				if culmulativeOffset >= cwndSize {
-					culmulativeOffset = 0
-					cwndSize += MSS
-					fmt.Println("[congestion avoidance] cw size increase to ", cwndSize/MSS)
+			} else if state == SlowStart {
+				dupAckCount = 0
+				if cwndSize <= header.WinSize - uint16(AckBytes) {
+					cwndSize += uint16(AckBytes)
+					fmt.Printf("[slow state] cw increase to %d\n", cwndSize/MSS)
 				}
-			}
-			// Slide window
-			cwndBase += offset
-			fmt.Println("[slide window] cw base increase to ", cwndBase/MSS)
+				if cwndSize >= ssthresh {
+					state = CongestionAvoidance
+				}
 
-			// Restart RTO timer
+			} else if state == CongestionAvoidance {
+				dupAckCount = 0
+				culmulativeAckBytes += uint16(AckBytes)
+				if culmulativeAckBytes >= cwndSize && cwndSize <= header.WinSize - MSS {
+					culmulativeAckBytes = 0
+					cwndSize += MSS
+					fmt.Printf("[congestion avoidance] cw increase to %d\n", cwndSize/MSS)
+				}
+			} else {
+				fmt.Println("error state")
+			}
+			curAckNum = header.AckNum
+			cwndBase += AckBytes
+			winUpdate <- true
+			fmt.Printf("[slide window] cw base set to %d\n", cwndBase/MSS)
+			// Restatr timer
 			stop := timer.Stop()
 			if stop {
 				startTimer()
 			}
 
-		} else if header.AckNum == lastAckNum {
-			// Duplicate ACK
-			dupAckCount += 1
-			if dupAckCount == 3 {
-				isCongestion = true
-				// Enter Fast Recovery state
-				fmt.Println("[Congestion] receive 3 DupACKs.")
-				ssthresh = cwndSize / 2
-				fmt.Println("[Congestion] ssthresh set to ", ssthresh/MSS)
-				cwndSize = ssthresh + 3*MSS
-				fmt.Println("[Congestion] cw size decrease to ", cwndSize/MSS)
-				// Notify sender goroutine to resend data through channel
-				ch <- lastAckNum
 
-			} else if dupAckCount > 3 {
-				if cwndSize <= header.WinSize-MSS {
-					cwndSize += MSS
-					fmt.Println("[Fast Recovery] cw size increase to ", cwndSize/MSS)
+		} else if header.AckNum == curAckNum {
+			// Duplicate ACK
+			fmt.Println("receive duplicate ACK: ", header.AckNum/MSS)
+			if state == FastRecovery && cwndSize <= header.WinSize - MSS {
+				cwndSize += MSS
+				fmt.Printf("[fast reocovery] cw set to %d\n", cwndSize/MSS)
+
+			} else if state == SlowStart {
+				dupAckCount++
+				if dupAckCount == 3 {
+					state = FastRecovery
+					ssthresh = cwndSize / 2
+					if ssthresh < 2 * MSS {
+						ssthresh = 2 * MSS
+					}
+					cwndSize = ssthresh + 3 * MSS
+					ch <- curAckNum // Retransmit missing packet
+					fmt.Printf("receive 3 dup Acks, ssthresh set to %d, cw size set to %d, retransmit %d\n", ssthresh, cwndSize, curAckNum)
+				}
+			} else if state == CongestionAvoidance {
+				dupAckCount++
+				if dupAckCount == 3{
+					state = FastRecovery
+					ssthresh = cwndSize / 2
+					if ssthresh < 2 * MSS {
+						ssthresh = 2 * MSS
+					}
+					cwndSize = ssthresh + 3 * MSS
+					ch <- curAckNum
+					fmt.Printf("receive 3 dup Acks, ssthresh set to %d, cw size set to %d, retransmit %d\n", ssthresh, cwndSize, curAckNum)
 				}
 			}
+			winUpdate <- true
+
+		} else {
+			// Receive Ack number less than current Ack number, do nothing
 		}
 	}
 }
@@ -245,14 +269,16 @@ func sendFile(filename string) {
 	fmt.Printf("%s's size: %d\n", filename, filesize)
 
 	// Init sender's global variables
+	state = SlowStart
 	syncSeqNum = 0
 	nextSeqNum = syncSeqNum
-	lastAckNum = syncSeqNum
+	curAckNum = syncSeqNum
 	cwndSize = 1 * MSS
 	cwndBase = 0
 	ssthresh = 32 * MSS
 	dupAckCount = 0
 	ch = make(chan uint32)
+	winUpdate = make(chan bool)
 
 	// Setup sending conn
 	conn := setupConn(DestAddr)
@@ -273,38 +299,47 @@ func sendFile(filename string) {
 	// Init RTO timer
 	startTimer()
 
+	start := time.Now()
+
 	for {
 		select {
 
 		case seqNum := <-ch:
 			// Retransmit seqNum
-			offset := seqNum - syncSeqNum
-			if offset+MSS < filesize {
-				sendDATA(conn, seqNum, fileBytes[offset:offset+MSS])
+			bytePos := seqNum - syncSeqNum
+			if bytePos+MSS < filesize {
+				sendDATA(conn, seqNum, fileBytes[bytePos:bytePos+MSS])
 			} else {
-				sendDATA(conn, seqNum, fileBytes[offset:filesize])
+				sendDATA(conn, seqNum, fileBytes[bytePos:filesize])
+			}
+
+		case <- winUpdate:
+			bytePos := nextSeqNum - syncSeqNum
+			if bytePos-cwndBase < uint32(cwndSize) {
+				if bytePos+MSS < filesize {
+					sendDATA(conn, nextSeqNum, fileBytes[bytePos:bytePos+MSS])
+					nextSeqNum = syncSeqNum + bytePos + MSS
+				} else {
+					sendDATA(conn, nextSeqNum, fileBytes[bytePos:filesize])
+					nextSeqNum = syncSeqNum + bytePos + (filesize - bytePos)
+				}
 			}
 
 		default:
-			offset := nextSeqNum - syncSeqNum
-			if offset-cwndBase < uint32(cwndSize) {
-				if offset+MSS < filesize {
-					sendDATA(conn, nextSeqNum, fileBytes[offset:offset+MSS])
-					nextSeqNum = syncSeqNum + offset + MSS
-				} else {
-					sendDATA(conn, nextSeqNum, fileBytes[offset:filesize])
-					nextSeqNum = syncSeqNum + offset + (filesize - offset)
-				}
-			}
+
 		}
 
 		if cwndBase == filesize {
-			fmt.Println("finish")
+			fmt.Printf("%s transfer finish\n", filename)
 			break
 		}
 	}
+
+	end := time.Now()
+	t := end.Sub(start)
+	fmt.Printf("average bandwidth %f MB/s\n", float64(filesize) / t.Seconds() / 100000)
 }
 
 func main() {
-	sendFile("file")
+	sendFile("bfile")
 }
